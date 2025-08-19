@@ -2,7 +2,7 @@ import streamlit as st
 import threading
 import queue
 import time
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import os
 
@@ -17,40 +17,25 @@ st.set_page_config(
 )
 
 # Model configuration
-MODEL_NAME = "google/gemma-3-270m"
+MODEL_NAME = "ANISH-j/gemma"
 
 @st.cache_resource
-def load_model_pipeline():
-    """Load the model pipeline with optimized settings"""
+def load_model_and_tokenizer():
+    """Load the model and tokenizer directly"""
     try:
-        # Load tokenizer first
+        # Load model directly as specified
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+        
+        # Set pad token if not present
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Load model with optimal settings
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.float32,  # Use float32 for better compatibility
-            device_map=None,  # Keep on CPU for stability
-            low_cpu_mem_usage=True,
-            trust_remote_code=True
-        )
-        
-        # Create pipeline
-        pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            device=-1,  # Force CPU
-            torch_dtype=torch.float32
-        )
-        
-        return pipe
+        return model, tokenizer
         
     except Exception as e:
         st.error(f"Model loading error: {str(e)}")
-        return None
+        return None, None
 
 def format_prompt(message, history):
     """Format prompt for Gemma"""
@@ -65,21 +50,32 @@ def format_prompt(message, history):
     conversation += f"User: {message}\nAssistant:"
     return conversation
 
-def generate_response_threaded(pipe, prompt, result_queue, max_tokens=256, temp=0.7):
-    """Generate response in a separate thread"""
+def generate_response_threaded(model, tokenizer, prompt, result_queue, max_tokens=256, temp=0.7):
+    """Generate response in a separate thread using direct model inference"""
     try:
-        response = pipe(
-            prompt,
-            max_new_tokens=max_tokens,
-            temperature=temp,
-            do_sample=True,
-            pad_token_id=pipe.tokenizer.eos_token_id,
-            return_full_text=False,
-            truncation=True
-        )
+        # Tokenize input
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
         
-        text = response[0]["generated_text"].strip()
-        result_queue.put(("success", text))
+        # Generate response
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temp,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3
+            )
+        
+        # Decode response
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract only the new part (remove the input prompt)
+        response = generated_text[len(prompt):].strip()
+        
+        result_queue.put(("success", response))
         
     except Exception as e:
         result_queue.put(("error", str(e)))
@@ -88,13 +84,15 @@ def main():
     st.title("🤖 Gemma Chat")
     
     # Load model
-    if "pipeline" not in st.session_state:
-        with st.spinner("Loading model..."):
-            st.session_state.pipeline = load_model_pipeline()
-    
-    if st.session_state.pipeline is None:
-        st.error("Failed to load model")
-        st.stop()
+    if "model" not in st.session_state or "tokenizer" not in st.session_state:
+        with st.spinner("Loading ANISH-j/gemma model..."):
+            model, tokenizer = load_model_and_tokenizer()
+            if model is not None and tokenizer is not None:
+                st.session_state.model = model
+                st.session_state.tokenizer = tokenizer
+            else:
+                st.error("Failed to load model")
+                st.stop()
     
     # Simple controls
     col1, col2 = st.columns([3, 1])
@@ -138,7 +136,7 @@ def main():
             # Start generation in thread
             thread = threading.Thread(
                 target=generate_response_threaded,
-                args=(st.session_state.pipeline, formatted_prompt, result_queue, max_tokens, temp)
+                args=(st.session_state.model, st.session_state.tokenizer, formatted_prompt, result_queue, max_tokens, temp)
             )
             thread.start()
             
