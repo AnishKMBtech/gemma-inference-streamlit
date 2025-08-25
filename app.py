@@ -1,135 +1,432 @@
 import streamlit as st
-import threading
-import queue
-import time
 import os
-from llama_cpp import Llama
+import tempfile
+from pathlib import Path
+from typing import List, Optional
+import numpy as np
+import faiss
 
-# Page configuration
-st.set_page_config(
-    page_title="Gemma Chat",
-    page_icon="🤖",
-    layout="centered"
-)
+# LangChain imports
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain.llms.base import LLM
+from langchain.callbacks.manager import CallbackManagerForLLMRun
+from langchain.schema import Document
 
-# Path to your GGUF model (must be downloaded locally)
-MODEL_PATH = "gemma-3-270m-it-UD-IQ2_M.gguf"
+# OpenAI for embeddings and requests for OpenRouter
+import openai
+import requests
 
-@st.cache_resource
-def load_model():
-    """Load GGUF model with llama-cpp (optimized for 2 cores / 2GB RAM)"""
+# Embedded API keys for Streamlit Cloud deployment
+OPENROUTER_API_KEY = "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"
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+
+class OpenRouterLLM(LLM):
+    """Custom LLM wrapper for OpenRouter API."""
+    
+    model_name: str = "anthropic/claude-3-haiku"
+    api_key: str = ""
+    temperature: float = 0.7
+    max_tokens: int = 1000
+    
+    def __init__(self, api_key: str, model_name: str = "anthropic/claude-3-haiku", **kwargs):
+        super().__init__(**kwargs)
+        self.api_key = api_key
+        self.model_name = model_name
+    
+    @property
+    def _llm_type(self) -> str:
+        return "openrouter"
+    
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs,
+    ) -> str:
+        """Call the OpenRouter API."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:8501",  # Streamlit default
+            "X-Title": "Conversational RAG Chatbot"
+        }
+        
+        data = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        }
+        
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"Error calling OpenRouter API: {str(e)}"
+
+def load_and_process_documents(uploaded_files) -> List[Document]:
+    """Load and process uploaded documents."""
+    documents = []
+    
+    for uploaded_file in uploaded_files:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+        
+        try:
+            # Load document based on file type
+            if uploaded_file.name.endswith('.pdf'):
+                loader = PyPDFLoader(tmp_file_path)
+            elif uploaded_file.name.endswith('.txt'):
+                loader = TextLoader(tmp_file_path)
+            else:
+                st.warning(f"Unsupported file type: {uploaded_file.name}")
+                continue
+            
+            docs = loader.load()
+            documents.extend(docs)
+            
+        except Exception as e:
+            st.error(f"Error loading {uploaded_file.name}: {str(e)}")
+        finally:
+            # Clean up temporary file
+            os.unlink(tmp_file_path)
+    
+    return documents
+
+def create_faiss_index_from_documents(documents: List[Document], embeddings) -> Optional[FAISS]:
+    """Create FAISS index programmatically from documents."""
+    if not documents:
+        return None
+    
+    # Split documents into chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
+    )
+    
+    # Split all documents into chunks
+    text_chunks = text_splitter.split_documents(documents)
+    
+    if not text_chunks:
+        return None
+    
+    # Create FAISS vector store programmatically
     try:
-        llm = Llama(
-            model_path=MODEL_PATH,
-            n_ctx=2048,         # keep context smaller
-            n_threads=2,        # limit to 2 CPU cores
-            n_batch=64,         # small batch to save RAM
-            verbose=False
-        )
-        return llm
+        # Create vectors from text chunks using embeddings
+        vector_store = FAISS.from_documents(text_chunks, embeddings)
+        return vector_store
     except Exception as e:
-        st.error(f"Model loading error: {str(e)}")
+        st.error(f"Error creating FAISS index: {str(e)}")
         return None
 
-def format_prompt(message, history):
-    """Format prompt for chat"""
-    conversation = ""
-    for msg in history[-6:]:
-        if msg["role"] == "user":
-            conversation += f"User: {msg['content']}\n"
-        else:
-            conversation += f"Assistant: {msg['content']}\n"
-    conversation += f"User: {message}\nAssistant:"
-    return conversation
-
-def generate_response_threaded(llm, prompt, result_queue, max_tokens=256, temp=0.7):
-    """Generate response in a thread with llama-cpp"""
+def save_faiss_index(vector_store: FAISS, index_path: str = "faiss_index"):
+    """Save FAISS index to disk."""
     try:
-        output = llm(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temp,
-            top_p=0.9,
-            repeat_penalty=1.1,
-            stop=["User:", "Assistant:"]
-        )
-        response = output["choices"][0]["text"].strip()
-        result_queue.put(("success", response))
+        # Create directory if it doesn't exist
+        os.makedirs(index_path, exist_ok=True)
+        # Save the vector store
+        vector_store.save_local(index_path)
+        return True
     except Exception as e:
-        result_queue.put(("error", str(e)))
+        st.error(f"Error saving FAISS index: {str(e)}")
+        return False
 
-def main():
-    st.title("🤖 Gemma Chat (GGUF - Low Resource)")
+def load_faiss_index(embeddings, index_path: str = "faiss_index") -> Optional[FAISS]:
+    """Load FAISS index from disk."""
+    try:
+        if os.path.exists(index_path):
+            vector_store = FAISS.load_local(
+                index_path, 
+                embeddings, 
+                allow_dangerous_deserialization=True
+            )
+            return vector_store
+    except Exception as e:
+        st.error(f"Error loading FAISS index: {str(e)}")
+    return None
 
-    # Load model
-    if "llm" not in st.session_state:
-        with st.spinner("Loading Gemma-3-270M IT GGUF model..."):
-            llm = load_model()
-            if llm is not None:
-                st.session_state.llm = llm
+def rebuild_faiss_index(uploaded_files, embeddings):
+    """Rebuild FAISS index from uploaded documents."""
+    with st.spinner("Processing documents and building FAISS index..."):
+        try:
+            # Load and process documents
+            documents = load_and_process_documents(uploaded_files)
+            
+            if not documents:
+                st.error("No documents were successfully loaded")
+                return None
+            
+            # Create FAISS index programmatically
+            vector_store = create_faiss_index_from_documents(documents, embeddings)
+            
+            if vector_store:
+                # Save index to disk
+                if save_faiss_index(vector_store):
+                    st.success(f"✅ FAISS index created and saved! Processed {len(documents)} documents.")
+                    return vector_store
+                else:
+                    st.error("Failed to save FAISS index")
             else:
-                st.stop()
+                st.error("Failed to create FAISS index")
+                
+        except Exception as e:
+            st.error(f"Error rebuilding FAISS index: {str(e)}")
+        
+        return None
 
-    # Controls
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        max_tokens = st.slider("Max tokens", 50, 400, 200)
-        temp = st.slider("Temperature", 0.1, 1.5, 0.7, 0.1)
-        if st.button("Clear", type="secondary"):
-            st.session_state.messages = []
-            st.rerun()
-
-    # Init messages
+def initialize_session_state():
+    """Initialize Streamlit session state variables."""
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "faiss_index" not in st.session_state:
+        st.session_state.faiss_index = None
+    if "qa_chain" not in st.session_state:
+        st.session_state.qa_chain = None
+    if "index_stats" not in st.session_state:
+        st.session_state.index_stats = {"documents": 0, "chunks": 0}
 
-    # Show chat
+def main():
+    st.set_page_config(
+        page_title="Conversational RAG Chatbot",
+        page_icon="🤖",
+        layout="wide"
+    )
+    
+    st.title("🤖 Conversational RAG Chatbot")
+    st.subtitle("Powered by LangChain, FAISS, and OpenRouter")
+    
+    # Initialize session state
+    initialize_session_state()
+    
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        # Display API key status
+        st.success("✅ OpenRouter API Key: Configured")
+        
+        # OpenAI API Key for embeddings
+        openai_api_key = st.text_input(
+            "OpenAI API Key (for embeddings)",
+            type="password",
+            value=OPENAI_API_KEY,
+            help="Required for document embeddings. You can also set this in Streamlit secrets."
+        )
+        
+        # Use embedded OpenRouter key
+        openrouter_api_key = OPENROUTER_API_KEY
+        
+        # Model selection
+        model_options = [
+            "anthropic/claude-3-haiku",
+            "anthropic/claude-3-sonnet",
+            "openai/gpt-3.5-turbo",
+            "openai/gpt-4",
+            "meta-llama/llama-3-8b-instruct",
+            "google/gemma-7b-it"
+        ]
+        
+        selected_model = st.selectbox(
+            "Select Model",
+            model_options,
+            index=0
+        )
+        
+        st.divider()
+        
+        # FAISS Index Management
+        st.header("🗄️ FAISS Index Management")
+        
+        # Display current index status
+        if st.session_state.faiss_index is not None:
+            stats = st.session_state.index_stats
+            st.success(f"✅ Index Active: {stats['documents']} docs, {stats['chunks']} chunks")
+        else:
+            st.info("📄 No index loaded")
+        
+        # Document upload and index building
+        st.subheader("Build New Index")
+        uploaded_files = st.file_uploader(
+            "Upload documents to build FAISS index",
+            type=['pdf', 'txt'],
+            accept_multiple_files=True,
+            help="Upload PDF or TXT files to create a new FAISS index"
+        )
+        
+        # Build index button
+        if st.button("🔨 Build FAISS Index", use_container_width=True) and uploaded_files and openai_api_key:
+            # Initialize embeddings
+            embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+            
+            # Rebuild FAISS index
+            vector_store = rebuild_faiss_index(uploaded_files, embeddings)
+            
+            if vector_store:
+                st.session_state.faiss_index = vector_store
+                st.session_state.index_stats = {
+                    "documents": len(uploaded_files),
+                    "chunks": vector_store.index.ntotal
+                }
+                
+                # Create QA chain
+                if openrouter_api_key:
+                    llm = OpenRouterLLM(
+                        api_key=openrouter_api_key,
+                        model_name=selected_model
+                    )
+                    
+                    st.session_state.qa_chain = RetrievalQA.from_chain_type(
+                        llm=llm,
+                        chain_type="stuff",
+                        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
+                        return_source_documents=True
+                    )
+                
+                st.rerun()
+        
+        # Load existing index
+        st.subheader("Load Existing Index")
+        if st.button("📂 Load Saved Index", use_container_width=True) and openai_api_key:
+            try:
+                embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+                vector_store = load_faiss_index(embeddings)
+                
+                if vector_store:
+                    st.session_state.faiss_index = vector_store
+                    st.session_state.index_stats = {
+                        "documents": "Unknown",
+                        "chunks": vector_store.index.ntotal
+                    }
+                    
+                    if openrouter_api_key:
+                        llm = OpenRouterLLM(
+                            api_key=openrouter_api_key,
+                            model_name=selected_model
+                        )
+                        
+                        st.session_state.qa_chain = RetrievalQA.from_chain_type(
+                            llm=llm,
+                            chain_type="stuff",
+                            retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
+                            return_source_documents=True
+                        )
+                    
+                    st.success("✅ FAISS index loaded successfully!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ No saved FAISS index found")
+            except Exception as e:
+                st.error(f"Error loading FAISS index: {str(e)}")
+        
+        # Clear index
+        if st.button("🗑️ Clear Index", use_container_width=True):
+            st.session_state.faiss_index = None
+            st.session_state.qa_chain = None
+            st.session_state.index_stats = {"documents": 0, "chunks": 0}
+            st.success("Index cleared!")
+            st.rerun()
+        
+        st.divider()
+        
+        # Clear conversation
+        if st.button("💬 Clear Conversation", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+    
+    # Main chat interface
+    st.header("💬 Chat Interface")
+    
+    # Check if system is ready
+    if not openrouter_api_key:
+        st.error("OpenRouter API key is not configured. Please check the app configuration.")
+        return
+    
+    if not openai_api_key:
+        st.warning("⚠️ Please enter your OpenAI API key for embeddings in the sidebar, or configure it in Streamlit secrets.")
+        st.info("💡 **Quick Start**: You can use a demo OpenAI key for testing. Get one at: https://platform.openai.com/api-keys")
+        return
+    
+    if st.session_state.qa_chain is None:
+        st.info("📋 **Getting Started:**\n"
+                "1. Enter your OpenAI API key in the sidebar\n"
+                "2. Upload PDF or TXT documents\n" 
+                "3. Click 'Build FAISS Index' to process documents\n"
+                "4. Start chatting with your documents!")
+        return
+    
+    # Display chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
-
-    # Input
-    if prompt := st.chat_input("Ask me anything..."):
+            st.markdown(message["content"])
+            
+            # Show sources if available
+            if message["role"] == "assistant" and "sources" in message:
+                with st.expander("📚 Sources"):
+                    for i, source in enumerate(message["sources"]):
+                        st.write(f"**Source {i+1}:**")
+                        st.write(source[:500] + "..." if len(source) > 500 else source)
+                        st.divider()
+    
+    # Chat input
+    if prompt := st.chat_input("Ask a question about your documents..."):
+        # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message
         with st.chat_message("user"):
-            st.write(prompt)
-
+            st.markdown(prompt)
+        
+        # Generate assistant response
         with st.chat_message("assistant"):
-            response_placeholder = st.empty()
-            response_placeholder.write("Thinking...")
-
-            result_queue = queue.Queue()
-            formatted_prompt = format_prompt(prompt, st.session_state.messages[:-1])
-
-            thread = threading.Thread(
-                target=generate_response_threaded,
-                args=(st.session_state.llm, formatted_prompt, result_queue, max_tokens, temp)
-            )
-            thread.start()
-
-            start_time = time.time()
-            response = ""
-
-            while thread.is_alive():
-                if time.time() - start_time > 25:  # smaller timeout
-                    response = "Response timeout. Please try again."
-                    break
-                time.sleep(0.1)
-
-            if not result_queue.empty():
-                status, result = result_queue.get()
-                if status == "success":
-                    response = result
-                else:
-                    response = f"Error: {result}"
-
-            thread.join(timeout=1)
-
-            if not response.strip():
-                response = "I apologize, I couldn't generate a proper response."
-
-            response_placeholder.write(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+            with st.spinner("Thinking..."):
+                try:
+                    # Get response from QA chain
+                    result = st.session_state.qa_chain({"query": prompt})
+                    answer = result["result"]
+                    source_docs = result.get("source_documents", [])
+                    
+                    # Display answer
+                    st.markdown(answer)
+                    
+                    # Prepare sources
+                    sources = [doc.page_content for doc in source_docs]
+                    
+                    # Show sources
+                    if sources:
+                        with st.expander("📚 Sources"):
+                            for i, source in enumerate(sources):
+                                st.write(f"**Source {i+1}:**")
+                                st.write(source[:500] + "..." if len(source) > 500 else source)
+                                st.divider()
+                    
+                    # Add assistant message to chat history
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": answer,
+                        "sources": sources
+                    })
+                    
+                except Exception as e:
+                    error_message = f"Error generating response: {str(e)}"
+                    st.error(error_message)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": error_message
+                    })
 
 if __name__ == "__main__":
     main()
