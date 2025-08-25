@@ -12,6 +12,7 @@ from langchain.callbacks.manager import CallbackManagerForLLMRun
 from langchain.schema import Document
 from langchain_core.embeddings import Embeddings
 
+OPENROUTER_API_KEY = "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"
 
 # 🔑 Embedded OpenRouter API key
 OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
