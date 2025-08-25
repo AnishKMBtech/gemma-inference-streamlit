@@ -1,30 +1,25 @@
 import streamlit as st
 import os
 import tempfile
-from pathlib import Path
 from typing import List, Optional
-import numpy as np
-import faiss
-
-# LangChain imports
+import requests
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.llms.base import LLM
 from langchain.callbacks.manager import CallbackManagerForLLMRun
 from langchain.schema import Document
-
-# OpenAI for embeddings and requests for OpenRouter
-import openai
-import requests
-
-# Embedded API keys for Streamlit Cloud deployment
-OPENROUTER_API_KEY = "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"
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+from langchain_core.embeddings import Embeddings
 
 
+# 🔑 Embedded OpenRouter API key
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
+
+
+# ===============================
+# OpenRouter LLM Wrapper
+# ===============================
 class OpenRouterLLM(LLM):
     """Custom LLM wrapper for OpenRouter API."""
 
@@ -49,11 +44,10 @@ class OpenRouterLLM(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs,
     ) -> str:
-        """Call the OpenRouter API."""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8501",  # Streamlit default
+            "HTTP-Referer": "http://localhost:8501",
             "X-Title": "Conversational RAG Chatbot"
         }
 
@@ -77,18 +71,58 @@ class OpenRouterLLM(LLM):
             return f"Error calling OpenRouter API: {str(e)}"
 
 
-def load_and_process_documents(uploaded_files) -> List[Document]:
-    """Load and process uploaded documents."""
-    documents = []
+# ===============================
+# OpenRouter Embeddings Wrapper
+# ===============================
+class OpenRouterEmbeddings(Embeddings):
+    """Custom embeddings class using OpenRouter API (OpenAI-compatible)."""
 
+    def __init__(self, api_key: str, model: str = "openai/text-embedding-3-small"):
+        self.api_key = api_key
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed(text)
+
+    def _embed(self, text: str) -> List[float]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:8501",
+            "X-Title": "Conversational RAG Chatbot"
+        }
+        data = {
+            "model": self.model,
+            "input": text
+        }
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/embeddings",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result["data"][0]["embedding"]
+        except Exception as e:
+            st.error(f"Embedding error: {str(e)}")
+            return []
+
+
+# ===============================
+# Document Handling & FAISS
+# ===============================
+def load_and_process_documents(uploaded_files) -> List[Document]:
+    documents = []
     for uploaded_file in uploaded_files:
-        # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_file_path = tmp_file.name
 
         try:
-            # Load document based on file type
             if uploaded_file.name.endswith('.pdf'):
                 loader = PyPDFLoader(tmp_file_path)
             elif uploaded_file.name.endswith('.txt'):
@@ -96,38 +130,22 @@ def load_and_process_documents(uploaded_files) -> List[Document]:
             else:
                 st.warning(f"Unsupported file type: {uploaded_file.name}")
                 continue
-
             docs = loader.load()
             documents.extend(docs)
-
         except Exception as e:
             st.error(f"Error loading {uploaded_file.name}: {str(e)}")
         finally:
-            # Clean up temporary file
             os.unlink(tmp_file_path)
-
     return documents
 
 
 def create_faiss_index_from_documents(documents: List[Document], embeddings) -> Optional[FAISS]:
-    """Create FAISS index programmatically from documents."""
     if not documents:
         return None
-
-    # Split documents into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-
-    # Split all documents into chunks
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
     text_chunks = text_splitter.split_documents(documents)
-
     if not text_chunks:
         return None
-
-    # Create FAISS vector store programmatically
     try:
         vector_store = FAISS.from_documents(text_chunks, embeddings)
         return vector_store
@@ -137,7 +155,6 @@ def create_faiss_index_from_documents(documents: List[Document], embeddings) -> 
 
 
 def save_faiss_index(vector_store: FAISS, index_path: str = "faiss_index"):
-    """Save FAISS index to disk."""
     try:
         os.makedirs(index_path, exist_ok=True)
         vector_store.save_local(index_path)
@@ -148,14 +165,9 @@ def save_faiss_index(vector_store: FAISS, index_path: str = "faiss_index"):
 
 
 def load_faiss_index(embeddings, index_path: str = "faiss_index") -> Optional[FAISS]:
-    """Load FAISS index from disk."""
     try:
         if os.path.exists(index_path):
-            vector_store = FAISS.load_local(
-                index_path,
-                embeddings,
-                allow_dangerous_deserialization=True
-            )
+            vector_store = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
             return vector_store
     except Exception as e:
         st.error(f"Error loading FAISS index: {str(e)}")
@@ -163,17 +175,13 @@ def load_faiss_index(embeddings, index_path: str = "faiss_index") -> Optional[FA
 
 
 def rebuild_faiss_index(uploaded_files, embeddings):
-    """Rebuild FAISS index from uploaded documents."""
     with st.spinner("Processing documents and building FAISS index..."):
         try:
             documents = load_and_process_documents(uploaded_files)
-
             if not documents:
                 st.error("No documents were successfully loaded")
                 return None
-
             vector_store = create_faiss_index_from_documents(documents, embeddings)
-
             if vector_store:
                 if save_faiss_index(vector_store):
                     st.success(f"✅ FAISS index created and saved! Processed {len(documents)} documents.")
@@ -182,15 +190,15 @@ def rebuild_faiss_index(uploaded_files, embeddings):
                     st.error("Failed to save FAISS index")
             else:
                 st.error("Failed to create FAISS index")
-
         except Exception as e:
             st.error(f"Error rebuilding FAISS index: {str(e)}")
-
         return None
 
 
+# ===============================
+# Session State
+# ===============================
 def initialize_session_state():
-    """Initialize Streamlit session state variables."""
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "faiss_index" not in st.session_state:
@@ -201,33 +209,24 @@ def initialize_session_state():
         st.session_state.index_stats = {"documents": 0, "chunks": 0}
 
 
+# ===============================
+# Main App
+# ===============================
 def main():
-    st.set_page_config(
-        page_title="Conversational RAG Chatbot",
-        page_icon="🤖",
-        layout="wide"
-    )
+    st.set_page_config(page_title="Conversational RAG Chatbot", page_icon="🤖", layout="wide")
 
     st.title("🤖 Conversational RAG Chatbot")
-    st.caption("Powered by LangChain, FAISS, and OpenRouter")  # ✅ FIXED
+    st.caption("Powered by LangChain, FAISS, and OpenRouter")
 
-    # Initialize session state
     initialize_session_state()
 
-    # Sidebar for configuration
     with st.sidebar:
         st.header("⚙️ Configuration")
 
-        st.success("✅ OpenRouter API Key: Configured")
-
-        openai_api_key = st.text_input(
-            "OpenAI API Key (for embeddings)",
-            type="password",
-            value=OPENAI_API_KEY,
-            help="Required for document embeddings. You can also set this in Streamlit secrets."
-        )
-
-        openrouter_api_key = OPENROUTER_API_KEY
+        if OPENROUTER_API_KEY:
+            st.success("✅ OpenRouter API Key: Configured")
+        else:
+            st.error("❌ OpenRouter API Key is missing. Add it in Streamlit secrets.")
 
         model_options = [
             "anthropic/claude-3-haiku",
@@ -238,11 +237,7 @@ def main():
             "google/gemma-7b-it"
         ]
 
-        selected_model = st.selectbox(
-            "Select Model",
-            model_options,
-            index=0
-        )
+        selected_model = st.selectbox("Select Model", model_options, index=0)
 
         st.divider()
 
@@ -255,65 +250,47 @@ def main():
             st.info("📄 No index loaded")
 
         st.subheader("Build New Index")
-        uploaded_files = st.file_uploader(
-            "Upload documents to build FAISS index",
-            type=['pdf', 'txt'],
-            accept_multiple_files=True,
-            help="Upload PDF or TXT files to create a new FAISS index"
-        )
+        uploaded_files = st.file_uploader("Upload documents to build FAISS index",
+                                          type=['pdf', 'txt'], accept_multiple_files=True)
 
-        if st.button("🔨 Build FAISS Index", use_container_width=True) and uploaded_files and openai_api_key:
-            embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+        if st.button("🔨 Build FAISS Index", use_container_width=True) and uploaded_files and OPENROUTER_API_KEY:
+            embeddings = OpenRouterEmbeddings(api_key=OPENROUTER_API_KEY)
             vector_store = rebuild_faiss_index(uploaded_files, embeddings)
-
             if vector_store:
                 st.session_state.faiss_index = vector_store
                 st.session_state.index_stats = {
                     "documents": len(uploaded_files),
                     "chunks": vector_store.index.ntotal
                 }
-
-                if openrouter_api_key:
-                    llm = OpenRouterLLM(
-                        api_key=openrouter_api_key,
-                        model_name=selected_model
-                    )
-
+                if OPENROUTER_API_KEY:
+                    llm = OpenRouterLLM(api_key=OPENROUTER_API_KEY, model_name=selected_model)
                     st.session_state.qa_chain = RetrievalQA.from_chain_type(
                         llm=llm,
                         chain_type="stuff",
                         retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
                         return_source_documents=True
                     )
-
                 st.rerun()
 
         st.subheader("Load Existing Index")
-        if st.button("📂 Load Saved Index", use_container_width=True) and openai_api_key:
+        if st.button("📂 Load Saved Index", use_container_width=True) and OPENROUTER_API_KEY:
             try:
-                embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+                embeddings = OpenRouterEmbeddings(api_key=OPENROUTER_API_KEY)
                 vector_store = load_faiss_index(embeddings)
-
                 if vector_store:
                     st.session_state.faiss_index = vector_store
                     st.session_state.index_stats = {
                         "documents": "Unknown",
                         "chunks": vector_store.index.ntotal
                     }
-
-                    if openrouter_api_key:
-                        llm = OpenRouterLLM(
-                            api_key=openrouter_api_key,
-                            model_name=selected_model
-                        )
-
+                    if OPENROUTER_API_KEY:
+                        llm = OpenRouterLLM(api_key=OPENROUTER_API_KEY, model_name=selected_model)
                         st.session_state.qa_chain = RetrievalQA.from_chain_type(
                             llm=llm,
                             chain_type="stuff",
                             retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
                             return_source_documents=True
                         )
-
                     st.success("✅ FAISS index loaded successfully!")
                     st.rerun()
                 else:
@@ -336,27 +313,20 @@ def main():
 
     st.header("💬 Chat Interface")
 
-    if not openrouter_api_key:
-        st.error("OpenRouter API key is not configured. Please check the app configuration.")
-        return
-
-    if not openai_api_key:
-        st.warning("⚠️ Please enter your OpenAI API key for embeddings in the sidebar, or configure it in Streamlit secrets.")
-        st.info("💡 **Quick Start**: You can use a demo OpenAI key for testing. Get one at: https://platform.openai.com/api-keys")
+    if not OPENROUTER_API_KEY:
+        st.error("❌ OpenRouter API key is missing.")
         return
 
     if st.session_state.qa_chain is None:
         st.info("📋 **Getting Started:**\n"
-                "1. Enter your OpenAI API key in the sidebar\n"
-                "2. Upload PDF or TXT documents\n"
-                "3. Click 'Build FAISS Index' to process documents\n"
-                "4. Start chatting with your documents!")
+                "1. Upload PDF or TXT documents\n"
+                "2. Click 'Build FAISS Index'\n"
+                "3. Start chatting with your documents!")
         return
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-
             if message["role"] == "assistant" and "sources" in message:
                 with st.expander("📚 Sources"):
                     for i, source in enumerate(message["sources"]):
@@ -366,34 +336,27 @@ def main():
 
     if prompt := st.chat_input("Ask a question about your documents..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-
         with st.chat_message("user"):
             st.markdown(prompt)
-
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
                     result = st.session_state.qa_chain({"query": prompt})
                     answer = result["result"]
                     source_docs = result.get("source_documents", [])
-
                     st.markdown(answer)
-
                     sources = [doc.page_content for doc in source_docs]
-
                     if sources:
                         with st.expander("📚 Sources"):
                             for i, source in enumerate(sources):
                                 st.write(f"**Source {i+1}:**")
                                 st.write(source[:500] + "..." if len(source) > 500 else source)
                                 st.divider()
-
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": answer,
                         "sources": sources
                     })
-
                 except Exception as e:
                     error_message = f"Error generating response: {str(e)}"
                     st.error(error_message)
